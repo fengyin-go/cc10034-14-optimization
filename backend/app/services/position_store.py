@@ -10,6 +10,14 @@ import re
 from datetime import datetime
 from typing import Any
 
+from app.gtid import (
+    GtidInterval,
+    count_by_source,
+    format_gtid_intervals,
+    merge_intervals,
+    parse_gtid_intervals,
+    total_count,
+)
 from app.services.base import BaseModuleService
 from app.pipeline import PositionSnapshot, pipeline_bus
 
@@ -57,6 +65,75 @@ class PositionStoreService(BaseModuleService):
             "updated_at": ps.updated_at.isoformat(),
             "source": ps.source,
         }
+
+    def save_source_coverage(self, instance: str,
+                             coverage: dict[str, list[tuple[int, int]]],
+                             binlog_name: str = "mysql-bin.000001",
+                             position: int = 0,
+                             source: str = "failover") -> PositionSnapshot:
+        """按事务来源登记 GTID 覆盖。
+
+        原始区间（含重叠）原样落到位点记录，归并去重在读取侧完成，
+        这样主备各自上报的区间都能保留，切换校验时再统一归并。
+        """
+        intervals = [
+            GtidInterval(src, start, end)
+            for src, ranges in coverage.items()
+            for (start, end) in ranges
+        ]
+        gtid_set = format_gtid_intervals(intervals)
+        ps = PositionSnapshot(
+            instance=instance,
+            binlog_name=binlog_name,
+            position=position,
+            gtid_set=gtid_set,
+            updated_at=datetime.now(),
+            source=source,
+        )
+        pipeline_bus.register_position(ps)
+        pipeline_bus.write_audit(
+            "位点存储", instance,
+            f"按来源登记 GTID 覆盖 {gtid_set}",
+            "position_store", "已记录"
+        )
+        return ps
+
+    def source_coverage(self, instance: str) -> dict[str, Any]:
+        """读取实例按来源归并后的 GTID 覆盖（已消除重复计数）。"""
+        ps = pipeline_bus.get_position(instance)
+        if ps is None:
+            return {"instance": instance, "found": False, "sources": {}, "counts": {}, "total": 0}
+        merged = merge_intervals(parse_gtid_intervals(ps.gtid_set))
+        return {
+            "instance": instance,
+            "found": True,
+            "sources": {src: [iv.to_dict() for iv in ivs] for src, ivs in merged.items()},
+            "counts": count_by_source(merged),
+            "total": total_count(merged),
+            "binlog_name": ps.binlog_name,
+            "position": ps.position,
+            "updated_at": ps.updated_at.isoformat(),
+        }
+
+    def sync_recovery_receipt(self, instance: str, applied: list[GtidInterval]) -> dict[str, Any]:
+        """把恢复回执同步回位点存储，供失败重试时核验已确认事务。"""
+        if applied:
+            pipeline_bus.record_recovery_receipt(instance, applied)
+            pipeline_bus.write_audit(
+                "恢复回执", instance,
+                f"确认恢复 {format_gtid_intervals(applied)}",
+                "position_store", "已记录"
+            )
+        merged = pipeline_bus.confirmed_receipts(instance)
+        return {
+            "instance": instance,
+            "recovered": {src: [iv.to_dict() for iv in ivs] for src, ivs in merged.items()},
+            "recovered_total": total_count(merged),
+        }
+
+    def recovered_coverage(self, instance: str) -> dict[str, list[GtidInterval]]:
+        """实例已确认恢复的归并区间（重试核验依据）。"""
+        return pipeline_bus.confirmed_receipts(instance)
 
     def compare_positions(self, pos_a: dict[str, Any], pos_b: dict[str, Any]) -> dict[str, Any]:
         """比较两个位点的差异。"""

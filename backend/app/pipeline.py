@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.gtid import GtidInterval, merge_intervals
+
 
 @dataclass
 class ChangeEventRecord:
@@ -80,6 +82,8 @@ class PipelineBus:
         # 位点注册 — checkpoint_manager/position_store 写入，cdc_channel/failover_group 消费
         self.positions: dict[str, PositionSnapshot] = {}
         self.checkpoints: list[CheckpointRecord] = []
+        # 恢复回执 — failover_group 恢复时按实例写入，position_store 读取用于重试核验
+        self.recovery_receipts: dict[str, list[GtidInterval]] = defaultdict(list)
         # Schema 注册 — schema_sync 写入，ddl_tracker/format_adapter 消费
         self.schema_registry: dict[str, list[dict[str, Any]]] = {}
         # SCD 状态 — scd_handler 核心存储
@@ -142,6 +146,14 @@ class PipelineBus:
     def get_position(self, instance: str) -> PositionSnapshot | None:
         """查询当前位点。"""
         return self.positions.get(instance)
+
+    def record_recovery_receipt(self, instance: str, intervals: list[GtidInterval]) -> None:
+        """记录一笔恢复回执（已确认应用的事务区间），供重试时核验。"""
+        self.recovery_receipts[instance].extend(intervals)
+
+    def confirmed_receipts(self, instance: str) -> dict[str, list[GtidInterval]]:
+        """查询实例已确认恢复的归并区间（同一来源重叠只计一次）。"""
+        return merge_intervals(self.recovery_receipts.get(instance, []))
 
     def calc_position_lag(self, source_pos: PositionSnapshot, target_pos: PositionSnapshot) -> int:
         """计算两个位点之间的落后字节数。"""
@@ -322,6 +334,7 @@ class PipelineBus:
             "ddl_count": len(self.ddl_log),
             "position_count": len(self.positions),
             "checkpoint_count": len(self.checkpoints),
+            "receipt_count": sum(len(v) for v in self.recovery_receipts.values()),
             "register_count": len(self.schema_registry),
             "scd_type1_keys": len(self.scd_type1_store),
             "scd_type2_keys": len(self.scd_type2_store),

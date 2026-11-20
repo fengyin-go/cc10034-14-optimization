@@ -77,5 +77,21 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 故障切换覆盖核验
+
+故障切换的 GTID 校验逻辑在 `backend/app/gtid.py`（区间归并引擎）与
+`backend/app/services/failover_group.py`（覆盖数据集 → 恢复计划 → 回执核验）：
+
+- 主备 GTID 区间按来源归并，同一来源重叠区间只计一次，异源同编号分别计算；
+- 位点存储按来源提供 GTID 覆盖，恢复只使用切换覆盖数据集中已获确认的范围；
+- 有依赖的事务等所需来源都覆盖后才进入恢复，恢复回执同步回位点存储，
+  失败重试不重复应用已确认事务。
+
+场景核验脚本（订单/库存双来源、库存缺口、依赖阻塞、中断重试、前后位点对照）：
+
+```bash
+cd backend && .venv/bin/python scripts/verify_failover_coverage.py
+```
+
 领域：数据工程
 子方向：数仓与数据湖
